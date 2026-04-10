@@ -11,6 +11,23 @@
     // ══════════════════════════════════════════
 
     // ── O/L Compulsory (auto-selected, cannot be removed) ──
+    const firebaseConfig = {
+        apiKey: "AIzaSyBNX8jXc7o1WrBJbodXWzg9v6LzLek-mYU",
+        authDomain: "score-tracker-27.firebaseapp.com",
+        projectId: "score-tracker-27",
+        storageBucket: "score-tracker-27.firebasestorage.app",
+        messagingSenderId: "246489207224",
+        appId: "1:246489207224:web:c78454d94c846aa06a7f4d",
+        measurementId: "G-5B37KPYPJQ"
+    };
+
+    // Initialize Firebase if scripts are loaded
+    if (typeof firebase !== 'undefined') {
+        firebase.initializeApp(firebaseConfig);
+        var db = firebase.firestore();
+        var auth = firebase.auth();
+    }
+
     const OL_COMPULSORY = [
         { id: 'ol_first_lang', label: 'First Language', icon: '🇱🇰', group: 'Compulsory' },
         { id: 'ol_english', label: 'English Language', icon: '📝', group: 'Compulsory' },
@@ -131,29 +148,96 @@
 
     const $ = (sel) => document.querySelector(sel);
 
-    // ── User DB (localStorage) ──
-    function getUsers() { try { return JSON.parse(localStorage.getItem(USERS_KEY)) || {}; } catch { return {}; } }
-    function saveUsers(u) { localStorage.setItem(USERS_KEY, JSON.stringify(u)); }
+    // ── User DB (localStorage fallback + Firestore) ──
+    async function getProfileData(email) {
+        if (!db) return null;
+        try {
+            const doc = await db.collection('users').doc(email).get();
+            return doc.exists ? doc.data() : null;
+        } catch (e) { console.error(e); return null; }
+    }
+
+    async function saveProfileData(email, data) {
+        if (!db) return;
+        try { await db.collection('users').doc(email).set(data, { merge: true }); }
+        catch (e) { console.error(e); }
+    }
+
     function getSession() { return localStorage.getItem(SESSION_KEY); }
     function setSession(email) { localStorage.setItem(SESSION_KEY, email); }
     function clearSession() { localStorage.removeItem(SESSION_KEY); }
-    function getProfile() {
+
+    // Global user state
+    let currentUserProfile = null;
+    let scoresCache = {};
+
+    async function syncProfile() {
         const email = getSession();
-        if (!email) return null;
-        const users = getUsers();
-        return users[email] || null;
+        if (!email) {
+            currentUserProfile = null;
+            scoresCache = {};
+            return null;
+        }
+
+        // Try Firestore first
+        const remote = await getProfileData(email);
+        if (remote) {
+            currentUserProfile = remote;
+            const subjects = [...remote.mainSubjects, ...(remote.optionalSubjects || [])];
+
+            // Parallel fetch all scores for better performance
+            await Promise.all(subjects.map(async (sid) => {
+                try {
+                    const snapshot = await db.collection('users').doc(email).collection('scores').doc(sid).get();
+                    if (snapshot.exists) {
+                        scoresCache[sid] = snapshot.data().entries || [];
+                    } else {
+                        // Migration check
+                        const local = JSON.parse(localStorage.getItem(scoreKey(email, sid)) || '[]');
+                        scoresCache[sid] = local;
+                        if (local.length > 0) await saveScores(sid, local);
+                    }
+                } catch (e) {
+                    console.warn(`Failed to sync subject: ${sid}`, e);
+                    scoresCache[sid] = scoresCache[sid] || [];
+                }
+            }));
+            return remote;
+        }
+
+        // Fallback/Migration from local
+        const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+        const local = localUsers[email];
+        if (local) {
+            currentUserProfile = local;
+            await saveProfileData(email, local); // Migrate to firestore
+            // Migrate scores too
+            const subjects = [...local.mainSubjects, ...(local.optionalSubjects || [])];
+            await Promise.all(subjects.map(async (sid) => {
+                const localScores = JSON.parse(localStorage.getItem(scoreKey(email, sid)) || '[]');
+                scoresCache[sid] = localScores;
+                if (localScores.length > 0) await saveScores(sid, localScores);
+            }));
+            return local;
+        }
+        return null;
     }
 
-    // ── Scores ──
+    function getProfile() { return currentUserProfile; }
+
+    // ── Scores (Firestore) ──
+    // ── Scores (Cache + Async Firestore) ──
     function loadScores(subjectId) {
-        const email = getSession();
-        if (!email) return [];
-        try { return JSON.parse(localStorage.getItem(scoreKey(email, subjectId))) || []; } catch { return []; }
+        return scoresCache[subjectId] || [];
     }
-    function saveScores(subjectId, scores) {
+
+    async function saveScores(subjectId, scores) {
+        scoresCache[subjectId] = scores;
         const email = getSession();
-        if (!email) return;
-        localStorage.setItem(scoreKey(email, subjectId), JSON.stringify(scores));
+        if (!email || !db) return;
+        try {
+            await db.collection('users').doc(email).collection('scores').doc(subjectId).set({ entries: scores });
+        } catch (e) { console.error(e); }
     }
 
     // ══════════ THEME ══════════
@@ -185,16 +269,59 @@
     initTheme();
     bindThemeToggle();
 
-    if (page === 'home') { requireLogin(); initHomePage(); }
-    else if (page === 'subject') { requireLogin(); initSubjectPage(); }
-    else { initLoginPage(); }
+    (async () => {
+        try {
+            // Initial render
+            if (page === 'home') {
+                await requireLogin();
+                initHomePage();
+            } else if (page === 'subject') {
+                await requireLogin();
+                initSubjectPage();
+            } else {
+                // For login page, we only need to check if user is ALREADY logged in locally
+                if (getSession()) await syncProfile();
+                initLoginPage();
+            }
+        } catch (err) {
+            console.error('Initialization error:', err);
+            // Ensure UI is initialized even if sync fails
+            if (page !== 'home' && page !== 'subject') initLoginPage();
+        }
+    })();
 
-    // ═══════════════════════════════════════
-    //              LOGIN PAGE
-    // ═══════════════════════════════════════
+    async function requireLogin() {
+        console.log('RequireLogin checking profile...', !!getProfile());
+        if (!getProfile()) {
+            if (auth) {
+                try {
+                    console.log('Waiting for Auth state...');
+                    const user = await Promise.race([
+                        new Promise(r => { const unsub = auth.onAuthStateChanged(u => { unsub(); r(u); }); }),
+                        new Promise(r => setTimeout(() => r(null), 2500))
+                    ]);
+                    if (user) {
+                        console.log('Auth confirmed for:', user.email);
+                        setSession(user.email);
+                        const prof = await syncProfile();
+                        if (prof) {
+                            console.log('Profile synced, proceeding');
+                            return;
+                        } else {
+                            console.warn('User authenticated but profile document missing in Firestore');
+                        }
+                    } else {
+                        console.log('No Auth user found or timeout');
+                    }
+                } catch (e) { console.warn('Auth check failed', e); }
+            }
+            console.log('Redirection to login.html triggered');
+            window.location.href = 'login.html';
+        }
+    }
+
     function initLoginPage() {
         if (getProfile()) { window.location.href = 'index.html'; return; }
-
         const authTabs = $('#authTabs');
         const loginForm = $('#loginForm');
         const signupForm = $('#signupForm');
@@ -213,15 +340,29 @@
         });
 
         // ── Login ──
-        loginForm.addEventListener('submit', (e) => {
+        loginForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const email = $('#loginEmail').value.trim().toLowerCase();
             const pw = $('#loginPassword').value;
-            const users = getUsers();
-            if (!users[email]) return showToast('Account not found');
-            if (users[email].password !== pw) return showToast('Incorrect password');
-            setSession(email);
-            window.location.href = 'index.html';
+            const btn = loginForm.querySelector('button[type="submit"]');
+
+            try {
+                btn.disabled = true;
+                if (auth) {
+                    await auth.signInWithEmailAndPassword(email, pw);
+                } else {
+                    // Local fallback if firebase fails to load
+                    const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+                    if (!localUsers[email]) throw new Error('Account not found');
+                    if (localUsers[email].password !== pw) throw new Error('Incorrect password');
+                }
+                setSession(email);
+                await syncProfile();
+                window.location.href = 'index.html';
+            } catch (err) {
+                showToast(err.message || 'Login failed');
+                btn.disabled = false;
+            }
         });
 
         // ── Google Sign-In (placeholder) ──
@@ -248,15 +389,18 @@
         });
 
         toStep2.addEventListener('click', () => {
+            console.log('Next button clicked');
             const name = $('#signupName').value.trim();
             const email = $('#signupEmail').value.trim().toLowerCase();
             const pw = $('#signupPassword').value;
             if (!name) return showToast('Please enter your name');
             if (!email) return showToast('Please enter your email');
             if (pw.length < 4) return showToast('Password must be at least 4 characters');
-            const users = getUsers();
+            console.log('Validating email:', email);
+            const users = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
             if (users[email]) return showToast('An account with this email already exists');
 
+            console.log('Moving to step 2');
             step1.style.display = 'none';
             step2.style.display = 'block';
             buildSubjectGrids(examType);
@@ -272,13 +416,16 @@
         const optionalSelected = new Set();
 
         function buildSubjectGrids(type) {
+            console.log('Building grids for:', type);
             const allSubjects = type === 'OL' ? OL_SUBJECTS : AL_SUBJECTS;
             const isOL = type === 'OL';
             const mainGrid = $('#mainSubjectGrid');
             const optGrid = $('#optionalSubjectGrid');
             const countEl = $('#mainSelectionCount');
             const submitBtn = $('#signupSubmitBtn');
-            const selLabel = mainGrid.closest('.subject-selection').querySelector('.selection-label');
+            if (!mainGrid || !optGrid) { console.error('Grids not found'); return; }
+            const parent = mainGrid.closest('.subject-selection');
+            const selLabel = parent ? parent.querySelector('.selection-label') : null;
             mainGrid.innerHTML = '';
             optGrid.innerHTML = '';
             mainSelected.clear();
@@ -357,36 +504,55 @@
         }
 
         // ── Signup submit ──
-        signupForm.addEventListener('submit', (e) => {
+        signupForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const name = $('#signupName').value.trim();
             const email = $('#signupEmail').value.trim().toLowerCase();
             const pw = $('#signupPassword').value;
             if (mainSelected.size !== 3) return showToast('Please select exactly 3 subjects');
 
-            // For OL: include compulsory subjects automatically
-            const compulsoryIds = examType === 'OL' ? OL_COMPULSORY.map(s => s.id) : [];
-            const allMain = [...compulsoryIds, ...mainSelected];
+            const btn = signupForm.querySelector('button[type="submit"]');
+            try {
+                btn.disabled = true;
+                console.log('Starting signup for:', email);
 
-            const users = getUsers();
-            users[email] = {
-                name,
-                password: pw,
-                examType,
-                mainSubjects: allMain,
-                optionalSubjects: [...optionalSelected],
-            };
-            saveUsers(users);
-            setSession(email);
-            window.location.href = 'index.html';
+                // For OL: include compulsory subjects automatically
+                const compulsoryIds = examType === 'OL' ? OL_COMPULSORY.map(s => s.id) : [];
+                const allMain = [...compulsoryIds, ...mainSelected];
+
+                const profile = {
+                    name,
+                    password: pw,
+                    examType,
+                    mainSubjects: allMain,
+                    optionalSubjects: [...optionalSelected],
+                };
+
+                if (auth) {
+                    console.log('Creating Firebase Auth user...');
+                    await auth.createUserWithEmailAndPassword(email, pw);
+                    console.log('Saving Firestore profile...');
+                    await saveProfileData(email, profile);
+                } else {
+                    console.warn('Firebase Auth missing, using local storage fallback');
+                    const users = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+                    users[email] = profile;
+                    localStorage.setItem(USERS_KEY, JSON.stringify(users));
+                }
+
+                setSession(email);
+                await syncProfile();
+                window.location.href = 'index.html';
+            } catch (err) {
+                showToast(err.message || 'Signup failed');
+                btn.disabled = false;
+            }
         });
     }
 
     // ═══════════════════════════════════════
     //             HOME PAGE
     // ═══════════════════════════════════════
-    function requireLogin() { if (!getProfile()) { window.location.href = 'login.html'; } }
-
     function getSubjectDB() {
         const profile = getProfile();
         return profile.examType === 'OL' ? [...OL_COMPULSORY, ...OL_SUBJECTS] : AL_SUBJECTS;
@@ -422,8 +588,12 @@
 
         const logoutBtn = $('#logoutBtn');
         if (logoutBtn) {
-            logoutBtn.addEventListener('click', () => {
-                if (confirm('Logout? Your data will be preserved.')) { clearSession(); window.location.href = 'login.html'; }
+            logoutBtn.addEventListener('click', async () => {
+                if (confirm('Logout? Your data is synced to the cloud.')) {
+                    if (auth) await auth.signOut();
+                    clearSession();
+                    window.location.href = 'login.html';
+                }
             });
         }
 
