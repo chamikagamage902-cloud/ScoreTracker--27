@@ -635,8 +635,8 @@ tbody td {
 .toast {
     position: fixed;
     bottom: 2rem;
-    left: 50%;
-    transform: translateX(-50%) translateY(120px);
+    right: 2rem;
+    transform: translateX(calc(100% + 2rem));
     background: var(--toast-bg);
     color: #f1f5f9;
     padding: 0.8rem 1.5rem;
@@ -652,7 +652,7 @@ tbody td {
 
 .toast.show {
     opacity: 1;
-    transform: translateX(-50%) translateY(0);
+    transform: translateX(0);
 }
 
 /* ══════════════════════════════════════
