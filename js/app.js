@@ -274,6 +274,7 @@
                     renderHomeStats();
                     renderHomeTable();
                     renderHomeChart();
+                    setTimeout(showMotivation, 1000); // Welcoming motivation
                 } else if (page === 'subject' && typeof renderSubjectAll === 'function') {
                     renderSubjectAll();
                 }
@@ -298,6 +299,7 @@
         if (!db) return;
         try {
             await db.collection('users').doc(email).collection('scores').doc(subjectId).set({ entries: scores });
+            showMotivation(true); // Encouragement after saving
         } catch (e) { console.error(e); }
     }
 
@@ -312,6 +314,34 @@
             localStorage.setItem(THEME_KEY, next);
             if (chart) renderChart();
         });
+    }
+
+    // ══════════ MOTIVATION ══════════
+    const MOTIVATIONAL_QUOTES = [
+        "The future belongs to those who believe in the beauty of their dreams. ✨",
+        "Your hard work will pay off. Keep chasing those 100s! 🎯",
+        "Every expert was once a beginner. Keep practicing! 📚",
+        "Don't stop until you're proud. You've got this! 💪",
+        "Success is the sum of small efforts, repeated day-in and day-out. 🔥",
+        "Focus on your goal. Don't look in any direction but ahead. 🚀",
+        "Believe you can and you're halfway there. 👑"
+    ];
+
+    function showMotivation(isNewScore = false) {
+        if (isNewScore) {
+            const congrats = [
+                "Amazing job! Keep that momentum going! 🎉",
+                "Excellent work! Your dedication is inspiring. 🌟",
+                "Fantastic! Another step closer to your goal. 📈"
+            ];
+            showToast(congrats[Math.floor(Math.random() * congrats.length)]);
+        } else {
+            // Only show home motivation once per session or randomly
+            if (!sessionStorage.getItem('motivation_shown')) {
+                showToast(MOTIVATIONAL_QUOTES[Math.floor(Math.random() * MOTIVATIONAL_QUOTES.length)]);
+                sessionStorage.setItem('motivation_shown', 'true');
+            }
+        }
     }
 
     // ══════════ TOAST ══════════
