@@ -171,6 +171,27 @@
     let currentUserProfile = null;
     let scoresCache = {};
 
+    // ── Cache Loading (SYCNCHRONOUS & INSTANT) ──
+    function loadCache() {
+        const email = getSession();
+        if (!email) return;
+
+        const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+        const localProfile = localUsers[email];
+        if (localProfile) {
+            currentUserProfile = localProfile;
+            const subjects = [...localProfile.mainSubjects, ...(localProfile.optionalSubjects || [])];
+            subjects.forEach(sid => {
+                if (!scoresCache[sid]) {
+                    scoresCache[sid] = JSON.parse(localStorage.getItem(scoreKey(email, sid)) || '[]');
+                }
+            });
+        }
+    }
+
+    // Call immediately
+    loadCache();
+
     async function syncProfile() {
         const email = getSession();
         if (!email) {
@@ -179,48 +200,85 @@
             return null;
         }
 
-        // Try Firestore first
+        // 1. If we have a profile already, just return it and sync in background
+        if (currentUserProfile) {
+            backgroundSync(email, currentUserProfile);
+            return currentUserProfile;
+        }
+
+        // 2. No memory profile? Try local storage (should be handled by loadCache but as fallback)
+        const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+        const localProfile = localUsers[email];
+        if (localProfile) {
+            currentUserProfile = localProfile;
+            backgroundSync(email, localProfile);
+            return localProfile;
+        }
+
+        // 3. No local data at all? Then we MUST wait for the first fetch from Firestore
         const remote = await getProfileData(email);
         if (remote) {
             currentUserProfile = remote;
-            const subjects = [...remote.mainSubjects, ...(remote.optionalSubjects || [])];
+            backgroundSync(email, remote);
+            return remote;
+        }
+        return null;
+    }
 
-            // Parallel fetch all scores for better performance
+    async function backgroundSync(email, currentProf) {
+        if (!db) return;
+        try {
+            // A. Sync Profile first
+            const remote = await getProfileData(email);
+            let profileChanged = false;
+            if (remote && JSON.stringify(remote) !== JSON.stringify(currentProf)) {
+                currentUserProfile = remote;
+                const users = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
+                users[email] = remote;
+                localStorage.setItem(USERS_KEY, JSON.stringify(users));
+                profileChanged = true;
+            }
+
+            // B. Sync Scores
+            const subjects = [...(currentUserProfile.mainSubjects || []), ...(currentUserProfile.optionalSubjects || [])];
+            let scoresChanged = false;
+
             await Promise.all(subjects.map(async (sid) => {
                 try {
                     const snapshot = await db.collection('users').doc(email).collection('scores').doc(sid).get();
                     if (snapshot.exists) {
-                        scoresCache[sid] = snapshot.data().entries || [];
-                    } else {
-                        // Migration check
-                        const local = JSON.parse(localStorage.getItem(scoreKey(email, sid)) || '[]');
-                        scoresCache[sid] = local;
-                        if (local.length > 0) await saveScores(sid, local);
+                        const remoteScores = snapshot.data().entries || [];
+                        if (JSON.stringify(remoteScores) !== JSON.stringify(scoresCache[sid])) {
+                            scoresCache[sid] = remoteScores;
+                            localStorage.setItem(scoreKey(email, sid), JSON.stringify(remoteScores));
+                            scoresChanged = true;
+                        }
+                    } else if (scoresCache[sid] && scoresCache[sid].length > 0) {
+                        // Upload local to remote if missing
+                        await db.collection('users').doc(email).collection('scores').doc(sid).set({ entries: scoresCache[sid] });
                     }
-                } catch (e) {
-                    console.warn(`Failed to sync subject: ${sid}`, e);
-                    scoresCache[sid] = scoresCache[sid] || [];
-                }
+                } catch (e) { console.warn(`Sync ${sid} failed`, e); }
             }));
-            return remote;
-        }
 
-        // Fallback/Migration from local
-        const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
-        const local = localUsers[email];
-        if (local) {
-            currentUserProfile = local;
-            await saveProfileData(email, local); // Migrate to firestore
-            // Migrate scores too
-            const subjects = [...local.mainSubjects, ...(local.optionalSubjects || [])];
-            await Promise.all(subjects.map(async (sid) => {
-                const localScores = JSON.parse(localStorage.getItem(scoreKey(email, sid)) || '[]');
-                scoresCache[sid] = localScores;
-                if (localScores.length > 0) await saveScores(sid, localScores);
-            }));
-            return local;
-        }
-        return null;
+            // C. Refresh UI if anything updated
+            if (profileChanged || scoresChanged) {
+                console.log('Sync complete: Updates found, refreshing UI');
+                if (page === 'home') {
+                    if (profileChanged) {
+                        const greeting = $('#userGreeting');
+                        if (greeting && currentUserProfile) greeting.textContent = `Hi, ${currentUserProfile.name}`;
+                        const badge = $('#examBadge');
+                        if (badge && currentUserProfile) badge.textContent = currentUserProfile.examType;
+                        buildHomeNav();
+                    }
+                    renderHomeStats();
+                    renderHomeTable();
+                    renderHomeChart();
+                } else if (page === 'subject' && typeof renderSubjectAll === 'function') {
+                    renderSubjectAll();
+                }
+            }
+        } catch (e) { console.error('Background sync fatal error', e); }
     }
 
     function getProfile() { return currentUserProfile; }
@@ -234,7 +292,10 @@
     async function saveScores(subjectId, scores) {
         scoresCache[subjectId] = scores;
         const email = getSession();
-        if (!email || !db) return;
+        if (!email) return;
+        // Always update local storage immediately for fast next-load
+        localStorage.setItem(scoreKey(email, subjectId), JSON.stringify(scores));
+        if (!db) return;
         try {
             await db.collection('users').doc(email).collection('scores').doc(subjectId).set({ entries: scores });
         } catch (e) { console.error(e); }
@@ -271,7 +332,10 @@
 
     (async () => {
         try {
-            // Initial render
+            // Priority 1: Always try to sync if we have a session (non-blocking if cached)
+            if (getSession()) await syncProfile();
+
+            // Priority 2: Page specific init
             if (page === 'home') {
                 await requireLogin();
                 initHomePage();
@@ -279,13 +343,15 @@
                 await requireLogin();
                 initSubjectPage();
             } else {
-                // For login page, we only need to check if user is ALREADY logged in locally
-                if (getSession()) await syncProfile();
+                // Login page
+                if (getProfile()) {
+                    window.location.replace('index.html');
+                    return;
+                }
                 initLoginPage();
             }
         } catch (err) {
             console.error('Initialization error:', err);
-            // Ensure UI is initialized even if sync fails
             if (page !== 'home' && page !== 'subject') initLoginPage();
         }
     })();
@@ -297,31 +363,30 @@
                 try {
                     console.log('Waiting for Auth state...');
                     const user = await Promise.race([
-                        new Promise(r => { const unsub = auth.onAuthStateChanged(u => { unsub(); r(u); }); }),
-                        new Promise(r => setTimeout(() => r(null), 2500))
+                        new Promise(r => { 
+                            const unsub = auth.onAuthStateChanged(u => { 
+                                unsub(); 
+                                r(u); 
+                            }); 
+                        }),
+                        new Promise(r => setTimeout(() => r(null), 1500)) // Slightly longer for the cold start
                     ]);
                     if (user) {
                         console.log('Auth confirmed for:', user.email);
                         setSession(user.email);
-                        const prof = await syncProfile();
-                        if (prof) {
-                            console.log('Profile synced, proceeding');
-                            return;
-                        } else {
-                            console.warn('User authenticated but profile document missing in Firestore');
-                        }
-                    } else {
-                        console.log('No Auth user found or timeout');
+                        // No need to await here because getProfile() might already be true from loadCache
+                        if (!getProfile()) await syncProfile();
+                        return;
                     }
                 } catch (e) { console.warn('Auth check failed', e); }
             }
-            console.log('Redirection to login.html triggered');
-            window.location.href = 'login.html';
+            console.log('No valid session found, redirecting to login');
+            window.location.replace('login.html'); // Use replace to prevent back-button loops
         }
     }
 
     function initLoginPage() {
-        if (getProfile()) { window.location.href = 'index.html'; return; }
+        // Safe check already done in IIFE
         const authTabs = $('#authTabs');
         const loginForm = $('#loginForm');
         const signupForm = $('#signupForm');
@@ -353,14 +418,22 @@
                 } else {
                     // Local fallback if firebase fails to load
                     const localUsers = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
-                    if (!localUsers[email]) throw new Error('Account not found');
+                    if (!localUsers[email]) throw new Error('Account not found in cache');
                     if (localUsers[email].password !== pw) throw new Error('Incorrect password');
                 }
                 setSession(email);
-                await syncProfile();
-                window.location.href = 'index.html';
+                const prof = await syncProfile();
+                if (!prof && auth) {
+                    // Edge case: Auth exists but Firestore profile missing?
+                    throw new Error('Profile setup incomplete. Please try signing up again.');
+                }
+                window.location.replace('index.html');
             } catch (err) {
-                showToast(err.message || 'Login failed');
+                console.error('Login Error:', err);
+                let msg = err.message;
+                if (msg.includes('user-not-found')) msg = 'Account not found';
+                if (msg.includes('wrong-password')) msg = 'Incorrect password';
+                showToast(msg || 'Login failed');
                 btn.disabled = false;
             }
         });
@@ -396,9 +469,6 @@
             if (!name) return showToast('Please enter your name');
             if (!email) return showToast('Please enter your email');
             if (pw.length < 4) return showToast('Password must be at least 4 characters');
-            console.log('Validating email:', email);
-            const users = JSON.parse(localStorage.getItem(USERS_KEY) || '{}');
-            if (users[email]) return showToast('An account with this email already exists');
 
             console.log('Moving to step 2');
             step1.style.display = 'none';
@@ -530,7 +600,14 @@
 
                 if (auth) {
                     console.log('Creating Firebase Auth user...');
-                    await auth.createUserWithEmailAndPassword(email, pw);
+                    try {
+                        await auth.createUserWithEmailAndPassword(email, pw);
+                    } catch (authErr) {
+                        if (authErr.code === 'auth/email-already-in-use') {
+                            throw new Error('An account with this email already exists in our database.');
+                        }
+                        throw authErr;
+                    }
                     console.log('Saving Firestore profile...');
                     await saveProfileData(email, profile);
                 } else {
@@ -542,8 +619,9 @@
 
                 setSession(email);
                 await syncProfile();
-                window.location.href = 'index.html';
+                window.location.replace('index.html');
             } catch (err) {
+                console.error('Signup Error:', err);
                 showToast(err.message || 'Signup failed');
                 btn.disabled = false;
             }
@@ -684,10 +762,16 @@
             loadScores(s.id).forEach(entry => { all.push({ ...entry, subject: s }); });
         });
         all.sort((a, b) => b.date.localeCompare(a.date));
+        
+        // Performance: Limit to 15 most recent for Home Page
+        const recent = all.slice(0, 15);
+        
         body.innerHTML = '';
         if (all.length === 0) { if (emptyMsg) emptyMsg.style.display = 'block'; return; }
         if (emptyMsg) emptyMsg.style.display = 'none';
-        all.forEach(s => {
+
+        const fragment = document.createDocumentFragment();
+        recent.forEach(s => {
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td>${formatDate(s.date)}</td>
@@ -695,8 +779,9 @@
                 <td class="paper-col">${s.paper || '—'}</td>
                 <td><strong>${s.score}</strong> / 100</td>
             `;
-            body.appendChild(tr);
+            fragment.appendChild(tr);
         });
+        body.appendChild(fragment);
     }
 
     // ── Home Chart ──
@@ -848,11 +933,15 @@
         const scores = loadScores(subj.id); body.innerHTML = '';
         if (scores.length === 0) { if (emptyMsg) emptyMsg.style.display = 'block'; return; }
         if (emptyMsg) emptyMsg.style.display = 'none';
+        
+        const fragment = document.createDocumentFragment();
         [...scores].reverse().forEach(s => {
             const tr = document.createElement('tr');
             tr.innerHTML = `<td>${formatDate(s.date)}</td><td class="paper-col">${s.paper || '—'}</td><td><span class="score-pill" style="background:${accent.dim}; color:${isDark() ? accent.color : accent.colorLight}">${s.score}</span></td><td><button class="btn-delete" data-date="${s.date}" data-paper="${s.paper || ''}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button></td>`;
-            body.appendChild(tr);
+            fragment.appendChild(tr);
         });
+        body.appendChild(fragment);
+
         body.querySelectorAll('.btn-delete').forEach(btn => {
             btn.addEventListener('click', () => {
                 let scores = loadScores(subj.id);
